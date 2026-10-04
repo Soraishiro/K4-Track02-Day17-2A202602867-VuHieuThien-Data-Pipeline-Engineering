@@ -1,416 +1,532 @@
-# Lab 17 — Data Pipeline Engineering (K4 Track 02 Day 17)
+# Lab 17 — Data Pipeline Engineering
 
-> Ghi chép cá nhân để học sâu về kiến trúc data pipeline: Bronze / Silver / Gold, CDC Debezium, idempotent write, late-arriving events, snapshot training, checksum-based correctness. Phong cách "dạy lại chính mình" như `S:\ai20k\Day16-Track2-Assignment\reflections.md`.
+Ghi chép này bắt đầu từ phần nền tảng trước, rồi mới đi vào ba lỗi của lab. Mình muốn hiểu được đường đi của dữ liệu và vai trò của từng công cụ trước khi đọc code chi tiết.
 
----
+## 1. Từ dữ liệu rời rạc tới một data pipeline
 
-## 1. Tổng quan — đường đi của một record
+Một hệ thống hỗ trợ khách hàng thường tạo dữ liệu ở nhiều chỗ.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         DAY 17 PIPELINE ARCHITECTURE                         │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐   │
-│  │  POSTGRES│    │  KAFKA  │    │    S3   │    │         │    │         │   │
-│  │ tickets │    │support. │    │transcripts│    │         │    │         │   │
-│  │  (CDC)  │    │ events  │    │  (JSON) │    │         │    │         │   │
-│  └────┬────┘    └────┬────┘    └────┬────┘    │         │    │         │   │
-│       │              │              │         │         │    │         │   │
-│       ▼              ▼              ▼         ▼         ▼    ▼         ▼   │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ BRONZE (lake/ — immutable Parquet, 1 file / source / day)            │   │
-│  │  _payload, _source, _op, _ingested_at, _batch_id,                    │   │
-│  │  _kafka_partition, _kafka_offset                                     │   │
-│  │  → Giữ NGUYÊN bản ghi trùng, tombstone, dữ liệu hỏng                 │   │
-│  └────────────────────────────┬─────────────────────────────────────────┘   │
-│                               │                                             │
-│                               ▼                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ STAGING (typed views over Bronze)                                     │   │
-│  │  ticket_changes_sql()  ← parse Debezium envelope                     │   │
-│  │  event_records_sql()   ← raw Kafka records                           │   │
-│  │  transcript_records_sql()                                            │   │
-│  │  event_lateness_sql()  ← đo P50/P95/P99 từ Bronze                   │   │
-│  └────────────────────────────┬─────────────────────────────────────────┘   │
-│                               │                                             │
-│           ┌───────────────────┼───────────────────┐                        │
-│           ▼                   ▼                   ▼                        │
-│  ┌──────────────────┐ ┌───────────────┐ ┌──────────────────┐              │
-│  │ SILVER TABLES    │ │ QUALITY GATE  │ │ QUARANTINE       │              │
-│  │                  │ │ (Pydantic)    │ │                  │              │
-│  │ silver_tickets   │ │ validate_events│ │ quarantine_events│              │
-│  │  (upsert by key) │ │ → valid / bad │ │ (bad record never│              │
-│  │ silver_history   │ │   record-level│ │  halts the run)  │              │
-│  │  (SCD Type 2)    │ └───────────────┘ └──────────────────┘              │
-│  │ silver_events    │                                                   │
-│  │  (MERGE dedup)   │                                                   │
-│  │ silver_transcripts                                                      │
-│  │  (latest export wins)                                                │
-│  └────────┬─────────┘                                                   │
-│           │                                                             │
-│           ▼                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ GOLD TABLES — "đúng hình dạng cho đúng người dùng"                   │   │
-│  │                                                                       │   │
-│  │ gold_feature_daily   ← routing agent    1 row = 1 user × 1 day      │   │
-│  │   (event_time, lookback window to absorb late events)               │   │
-│  │                                                                       │   │
-│  │ gold_training_set    ← classifier       immutable snapshot v<day>  │   │
-│  │   (rebuilt from Bronze AS OF that day, never edited)                │   │
-│  │                                                                       │   │
-│  │ gold_doc_chunks      ← RAG index        1 row = 1 chunk             │   │
-│  │   (embedding cached by hash(text) + model_version)                  │   │
-│  └────────────────────────────┬─────────────────────────────────────────┘   │
-│                               │                                             │
-│                               ▼                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │ CHECKSUM — order-independent md5 (the grading instrument)            │   │
-│  │  SELECT md5(string_agg(CAST(t AS VARCHAR), chr(10) ORDER BY ...))   │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+Thông tin của ticket nằm trong database. Mỗi lần người dùng click hoặc gửi feedback lại tạo thêm event. Nội dung hội thoại có thể được lưu thành file ở một hệ thống khác. Khi cần làm báo cáo, tạo feature cho model hoặc dựng dữ liệu huấn luyện, những nguồn này phải được gom lại và xử lý theo cùng một quy trình.
+
+Chuỗi công việc đó chính là **data pipeline**.
+
+Ở mức dễ hiểu nhất, pipeline trong bài này làm ba việc:
+
+1. nhận dữ liệu từ các nguồn;
+2. xử lý để dữ liệu có cấu trúc và đáng tin cậy hơn;
+3. tạo ra các bảng phục vụ cho từng nhu cầu phía sau.
+
+Cách nhìn này khá gần với mô tả chung của IBM và AWS: pipeline nhận dữ liệu từ nguồn, xử lý qua một số bước rồi đưa tới nơi lưu trữ hoặc nơi sử dụng tiếp theo.
+
+### Dữ liệu của lab đến từ đâu?
+
+Lab mô phỏng một nền tảng hỗ trợ khách hàng với ba loại dữ liệu.
+
+**Tickets** được xem như đang nằm trong Postgres, tức database chính của ứng dụng. Khi một ticket được tạo, cập nhật hoặc xoá, hệ thống cần biết thay đổi đó để cập nhật dữ liệu downstream.
+
+Để làm việc này, lab dùng cách biểu diễn của **Debezium**. Debezium là công cụ Change Data Capture, viết tắt là **CDC**. Hiểu đơn giản, CDC ghi nhận những thay đổi đã xảy ra trong database theo thời gian. Debezium đưa các thay đổi của từng row thành một dòng sự kiện để hệ thống khác đọc tiếp.
+
+**Support events** là các hành động như click hoặc feedback. Trong hệ thống thật, loại dữ liệu này thường đi qua một event stream như Kafka. Một event có thể bị gửi lại khi consumer retry, nên pipeline phải nhận ra trường hợp trùng.
+
+**Transcripts** là nội dung hội thoại được xuất thành file. Trong kiến trúc thật, loại file này có thể nằm ở object storage như S3.
+
+Lab không dựng ba hệ thống thật. Các dữ liệu nguồn đã được chuẩn bị sẵn dưới dạng JSON/JSONL trong thư mục `data/`. Nhờ vậy mình có thể tập trung vào cách xử lý dữ liệu mà vẫn giữ được cấu trúc gần với một hệ thống thực tế. Repo cũng ghi rõ Postgres/CDC, Kafka và S3 trong bài đều được mô phỏng bằng file.
+
+Luồng tổng quát:
+
+```text
+tickets
+events
+transcripts
+    │
+    ▼
+ Bronze
+    │
+    ▼
+Staging + kiểm tra dữ liệu
+    │
+    ▼
+ Silver
+    │
+    ▼
+  Gold
 ```
 
-**Key principle**: _Mọi thứ chạy lại được (idempotent), không sửa Silver/Gold bằng tay — rebuild từ Bronze._
+Mỗi tầng giải quyết một bước khác nhau.
+
+### Bronze — lưu lại dữ liệu đầu vào
+
+Bronze là nơi dữ liệu được ghi xuống đầu tiên.
+
+Mình coi đây là bản lưu gần với dữ liệu nguồn nhất. Record trùng, record delete hoặc record hỏng vẫn được giữ lại. Lý do rất thực tế: nếu logic xử lý phía sau cần sửa, mình còn dữ liệu gốc để chạy lại.
+
+Dữ liệu Bronze trong lab được lưu bằng **Parquet**. Đây là một định dạng file dạng cột thường dùng cho dữ liệu phân tích. File được chia theo nguồn và ngày ingest để dễ đọc lại từng phần.
+
+Các ý cần nhớ ở Bronze:
+
+- **raw data**: dữ liệu còn gần với nguồn;
+- **immutable**: file đã land thì không sửa nội dung cũ;
+- **partition**: chia dữ liệu thành từng phần, ở đây chủ yếu theo ngày;
+- **replay**: có thể đọc lại Bronze để dựng lại các tầng sau.
+
+### Staging — đọc dữ liệu nguồn thành cấu trúc dễ xử lý
+
+Dữ liệu nguồn thường mang theo cấu trúc riêng của từng hệ thống.
+
+Ví dụ record CDC của Debezium có thông tin về trạng thái trước và sau một thay đổi, loại thao tác và metadata đi kèm. Staging bóc các trường này ra thành những cột mà SQL phía sau có thể dùng trực tiếp.
+
+Đây cũng là lúc mình gặp khái niệm **LSN** trong dữ liệu Postgres CDC. LSN có thể hiểu là số thứ tự của thay đổi trong log của database. Khi cùng một ticket xuất hiện qua nhiều lần update, LSN giúp biết thay đổi nào xảy ra sau.
+
+### Quality gate — kiểm tra từng record
+
+Sau khi parse xong, một số record vẫn có thể sai dữ liệu.
+
+Trong lab, Pydantic được dùng để validate event. Một event thiếu `user_id` hoặc có rating ngoài tập cho phép sẽ được ghi sang khu vực **quarantine** cùng lý do.
+
+Quarantine là chỗ giữ record không đạt kiểm tra để mình xem lại sau. Nhờ đó những record hợp lệ vẫn tiếp tục được xử lý trong cùng một run.
+
+Khái niệm cần nhớ ở đây là **data contract**: dữ liệu muốn đi qua bước tiếp theo phải đáp ứng một số điều kiện đã định nghĩa trước.
+
+### Silver — dữ liệu đã có quy tắc rõ ràng
+
+Sau Bronze và Staging, dữ liệu bắt đầu được tổ chức theo cách mà ứng dụng phía sau có thể dùng ổn định hơn.
+
+Ví dụ `silver_tickets` cần trả lời một câu đơn giản: với mỗi `ticket_id`, trạng thái hiện tại là gì?
+
+Muốn làm được vậy, bảng phải có **key**. `ticket_id` chính là key của ticket.
+
+Khi cùng một ticket xuất hiện nhiều lần, mình gặp hai thao tác thường dùng:
+
+- **dedup**: bỏ các bản ghi trùng trong tập dữ liệu đang xét;
+- **upsert**: nếu key chưa có thì insert, nếu đã có thì update theo điều kiện.
+
+Trong lab, update còn phải nhìn vào LSN để trạng thái mới hơn thắng trạng thái cũ.
+
+Silver cũng giữ lịch sử ticket bằng **SCD Type 2**. Với cách này, mỗi giai đoạn tồn tại của một trạng thái được giữ thành một row riêng, kèm khoảng thời gian hiệu lực. Nhờ đó mình vừa có bảng current state, vừa có bảng history.
+
+PII như email và số điện thoại cũng được che ở Silver trước khi dữ liệu đi xa hơn.
+
+### Gold — dữ liệu được chuẩn bị cho từng mục đích sử dụng
+
+Gold là tầng đầu ra của pipeline.
+
+Mỗi bảng Gold trong lab phục vụ một nhu cầu khác nhau:
+
+- `gold_feature_daily`: feature theo user và ngày cho routing agent;
+- `gold_training_set`: dữ liệu snapshot cho classifier;
+- `gold_doc_chunks`: các đoạn text dùng để kiểm tra logic chunk và cache cho luồng RAG.
+
+Ở đây bắt đầu xuất hiện các khái niệm liên quan trực tiếp tới cách dữ liệu được dùng.
+
+**Event time** là thời điểm sự kiện thật sự xảy ra.  
+**Ingest time** là thời điểm pipeline nhận được sự kiện.
+
+Hai thời điểm này có thể cách nhau vài ngày. Khi event đến muộn, pipeline cần quay lại tính lại một số ngày trước đó. Số ngày nhìn lại được gọi là **lookback**.
+
+Với training data, lab dùng **snapshot**. Một snapshot là ảnh chụp trạng thái dữ liệu tại một mốc thời gian. Nếu dựng snapshot cho ngày 12/08 thì dữ liệu xuất hiện sau ngày đó chưa được phép làm thay đổi phiên bản cũ. Đây là ý chính của **point-in-time correctness**.
+
+Với `gold_doc_chunks`, output được cache theo nội dung và version. Khi input và version giống nhau, lần chạy sau có thể dùng lại kết quả đã có.
 
 ---
 
-## 2. Ba tầng dữ liệu — cam kết & kỹ thuật
+## 2. Stack được dùng trong lab
 
-### 2.1 Bronze — "Raw truth" (pipeline/bronze.py)
+Sau khi hiểu đường đi của dữ liệu, các công cụ trong repo dễ đặt đúng vị trí hơn.
 
-| Cam kết (slide)                         | Thực hiện trong code                                                                |
-| --------------------------------------- | ----------------------------------------------------------------------------------- |
-| **Immutable** — never UPDATE/DELETE     | `land_batch()`: nếu file Parquet đã tồn tại → `already-landed`, no-op (dòng 85-87)  |
-| **Append-only, 1 file / (source, day)** | Hive-style partition `ingest_date=YYYY-MM-DD/part-0.parquet` (dòng 37)              |
-| **Giữ duplicate, tombstone, bad data**  | CDC `op='d'` + tombstone (`value=null`) đều được land (dòng 72-75)                  |
-| **Idempotent landing**                  | `COPY TO .tmp → os.replace(tmp, out)` atomic (dòng 94-96)                           |
-| **Lineage đầy đủ**                      | `_payload` (JSON gốc), `_ingested_at` (Kafka timestamp), `_batch_id` (= ingest day) |
+### Python — phần điều phối chính
 
-**Tại sao giữ cả rác?** Silver mới có ngữ cảnh đủ để validate, dedup, quarantine. Bronze là _single source of truth_ cho audit & replay.
+Python nối các bước của pipeline lại với nhau: land Bronze, chạy transform, build Silver/Gold và gọi các bước kiểm tra.
 
-### 2.2 Staging — parse Debezium đúng (pipeline/staging.py)
+Lab còn dùng cùng một code path cho daily run và backfill. Cách này giúp giảm khả năng một nhánh chạy bình thường còn nhánh backfill dùng logic khác.
 
-Đọc CDC Debezium là nửa việc CDC:
+### DuckDB — engine SQL chạy local
 
-```
-Kafka record structure:
-  key   = {"ticket_id": "T-97"}
-  value = {"before": {...} | null,     # trước khi thay đổi (null cho c/r)
-           "after":  {...} | null,     # sau khi thay đổi  (null cho d)
-           "source": {"lsn": ..., "ts_ms": ...},
-           "op": "c" | "u" | "d" | "r"}
-  tombstone sau delete: key={"ticket_id":"T-97"}, value=null
-```
+DuckDB là nơi phần lớn câu SQL của pipeline được thực thi.
 
-**Ticket key nằm ở đâu khi `after=null`?** → ở **Kafka `key`** (dòng `j->'value'->'after'->>'ticket_id'` sẽ NULL cho op='d').  
-_Bug 3 gốc rễ_: `ticket_changes_sql()` chỉ extract từ `after` → delete mất key → bị filter `WHERE ticket_id IS NOT NULL` → không bao giờ đến Silver.  
-_Sửa_: extract `ticket_id` từ `j->'key'->>'ticket_id'` (Bronze lưu nguyên `_payload` JSON chứa cả `key`).
+Mình dùng nó để:
 
-LSN (`source.lsn`) là **sequence number** của Postgres WAL — **tăng đơn điệu toàn cục** → dùng để sort thay đổi mới hơn. `_changed_at` từ `ts_ms` (Debezium microsecond epoch).
+- đọc Parquet;
+- chạy window function;
+- dedup record;
+- `MERGE` dữ liệu vào bảng hiện có;
+- aggregate feature;
+- tính checksum.
 
-### 2.3 Silver — "1 hàng = 1 thực thể, có khoá" (pipeline/silver.py)
+`MERGE` là câu lệnh quan trọng trong bài. Khi target đã có cùng key, `MERGE` cho phép quyết định row đó nên được update hay giữ nguyên.
 
-| Bảng                    | Khoá                        | Chiến lược ghi                                                                                                                                   | Note                                              |
-| ----------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- |
-| `silver_tickets`        | `ticket_id`                 | **Upsert theo khoá** — `QUALIFY row_number() OVER (PARTITION BY ticket_id ORDER BY _lsn DESC) = 1` rồi `INSERT` (BUG: cần `MERGE`/`ON CONFLICT`) | PII masked by `mask_pii()` macro                  |
-| `silver_ticket_history` | (`ticket_id`, `valid_from`) | **SCD Type 2** — rebuild toàn bộ từ Bronze mỗi run (cheap ở cỡ này)                                                                              | `valid_to = lead(_changed_at)`, `is_current` flag |
-| `silver_events`         | `event_id`                  | **MERGE** insert when not matched + `QUALIFY` dedup by `_ingested_at, _kafka_offset`                                                             | Bad records → `quarantine_events`                 |
-| `silver_transcripts`    | `ticket_id`                 | **MERGE** update khi `exported_at` mới hơn                                                                                                       | PII masked                                        |
+DuckDB phù hợp với lab vì toàn bộ dữ liệu rất nhỏ và chạy trực tiếp trên máy cá nhân.
 
-**Idempotent write pattern** (slide "Bốn cách viết idempotent"):
+### Pydantic — kiểm tra cấu trúc event
 
-1. **Overwrite-partition** — xóa partition ngày rồi insert lại (Gold feature_daily)
-2. **MERGE upsert** — match on key, insert or update (silver_tickets, events, transcripts)
-3. **Rebuild full** — `CREATE OR REPLACE TABLE ... AS SELECT ...` (silver_history)
-4. **Insert-only + dedup view** — events là immutable facts
+Pydantic nằm ở quality gate.
 
-**PII masking** (pipeline/silver.py:24-30): macro `mask_pii()` dùng regex email + phone VN (`+84|0`...). Chỉ che email/phone — **tên người không che** (câu hỏi suy ngẫm 2).
+Schema mô tả một event hợp lệ cần những field nào và giá trị nào được chấp nhận. Record sai schema được đưa vào quarantine.
 
-### 2.4 Gold — ba nghĩa của "clean" (pipeline/gold.py)
+Nhờ vậy rule kiểm tra dữ liệu được viết thành code rõ ràng và có thể test được.
 
-| Bảng                 | Mục đích                 | Kỹ thuật then chốt                                                                                                                                                                 |
-| -------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gold_feature_daily` | Routing agent (realtime) | **Lookback window**: `DELETE WHERE event_date BETWEEN day-LB .. day` → recompute từ Silver. **Late events phải rơi đúng `event_date` (event_time)** chứ không phải `_ingested_at`. |
-| `gold_training_set`  | Classifier (offline)     | **Point-in-time snapshot** `v<day>` rebuilt from Bronze `upto=day`. Immutable — nếu tồn tại checksum khác nhau → raise `SnapshotImmutableError`.                                   |
-| `gold_doc_chunks`    | RAG index                | **Chunk** 40 words overlap 8 → deterministic `text_hash` → **embedding cache** keyed by `(text_hash, model_version)`. Re-run embeds 0 chunks mới.                                  |
+### dbt — viết transform theo dạng model SQL
 
-**Lookback = ceil(P99 lateness)** (slide "Data về muộn"): đo từ Bronze (`event_lateness_sql()`), không đoán. P99 = 3.00 ngày → `LOOKBACK_DAYS >= 3` (config.py:28 đang là 0 → bug 2).
+Repo có thêm một track dbt dùng cùng dữ liệu Bronze.
 
----
+dbt tổ chức mỗi phép biến đổi thành một **model**. Với bảng lớn, model có thể chạy theo kiểu **incremental**: lần sau xử lý phần dữ liệu mới hoặc phần cần cập nhật, thay vì dựng lại toàn bộ bảng.
 
-## 3. Ba lỗi cài sẵn (đã đoán trước khi sửa)
+Trong lab:
 
-### Lỗi 1 — Silver: `silver_tickets` append thay vì upsert (pipeline/silver.py:81-86)
+- `silver_tickets` dùng chiến lược `merge`;
+- `gold_feature_daily` dùng **microbatch**, tức chia xử lý thành từng khoảng thời gian nhỏ;
+- data test và unit test kiểm tra contract của model.
 
-|                     |                                                                                                                                                                                                                                                 |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Triệu chứng**     | `verify`: `silver_tickets has exactly one row per ticket_id (24 rows for 12 tickets)` — FAIL. T-91 hiện 3 state: `low/open`, `high/open`, `high/closed/bug` thay vì chỉ `high/closed/bug`.                                                      |
-| **Nguyên nhân gốc** | `upsert_silver_tickets()` dùng `INSERT INTO silver_tickets SELECT ... FROM _latest_changes` (dòng 81-86). Không có `MERGE` / `ON CONFLICT` → mỗi batch append thêm dòng. Khi re-run ngày cũ sau ngày mới, LSN cũ thắng LSN mới (sai!).          |
-| **Slide concept**   | "Silver — Có khoá", "Bốn cách viết idempotent" → MERGE upsert theo khoá `ticket_id`, tie-break bằng `_lsn DESC`.                                                                                                                                |
-| **Hướng sửa**       | Thay `INSERT` bằng `MERGE INTO silver_tickets AS t USING _latest_changes AS s ON t.ticket_id = s.ticket_id WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE ... WHEN NOT MATCHED THEN INSERT ...` (hoặc `ON CONFLICT DO UPDATE` nếu DuckDB hỗ trợ). |
+Sau khi chạy xong, `make parity` so kết quả của pipeline Python và dbt trên hai bảng chung. Repo dùng parity để kiểm tra hai cách triển khai có tạo ra cùng dữ liệu hay không.
 
-### Lỗi 2 — Late data: `LOOKBACK_DAYS = 0` nhưng P99 = 3 ngày (pipeline/config.py:28)
+### pytest và `scripts.verify` — kiểm tra logic
 
-|                     |                                                                                                                                                                                                                                                                                                                                                  |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Triệu chứng**     | `verify`: `gold_feature_daily reconciles with a full recompute` FAIL (checksum lệch). `u05's offline events of 08-12 (arrived 08-15) are counted on 08-12` FAIL (got `(2,0)` expected `(5,1)`). `LOOKBACK_DAYS covers measured P99 lateness` FAIL.                                                                                               |
-| **Nguyên nhân gốc** | `build_feature_daily()` recompute window `[day - LOOKBACK_DAYS, day]`. Với `LOOKBACK_DAYS=0`, chỉ recompute ngày `day`. Events của u05 (event_time 08-12, ingested 08-15) → batch 08-15 insert vào Silver → Gold chạy ngày 08-15 không nhìn ngược về 08-12 → feature 08-12 thiếu events. Full recompute (scan cả Silver) thì có → checksum khác. |
-| **Slide concept**   | "Data về muộn": _Measure, don't guess_ — lookback = ceil(P99 của `(_ingested_at - event_time)` đo từ Bronze).                                                                                                                                                                                                                                    |
-| **Hướng sửa**       | `config.LOOKBACK_DAYS = 3` (hoặc đọc dynamic từ `lateness_profile()`). Lưu ý: lookback áp dụng cho **mọi daily run**, không chỉ backfill.                                                                                                                                                                                                        |
+`pytest` chạy các test của code.
 
-### Lỗi 3 — Delete propagation: T-97 vẫn còn ở Silver/Training/RAG (pipeline/staging.py)
+`scripts.verify` kiểm tra các contract ở mức pipeline, ví dụ:
 
-|                     |                                                                                                                                                                                                                                                                                       |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Triệu chứng**     | `verify`: `deleted ticket T-97 is a tombstone` FAIL (got `is_deleted=False`, PII còn nguyên). `latest training snapshot excludes T-97` FAIL (1 row). `deletes propagate to RAG index: no chunk of T-97` FAIL (2 chunks).                                                              |
-| **Nguyên nhân gốc** | `ticket_changes_sql()` extract fields từ `value.after` (dòng 40-50). Khi `op='d'`, `after=null` → mọi cột NULL → `ticket_id IS NOT NULL` filter out (dòng 58). **Delete record không bao giờ vào staging → Silver không biết xoá.** Kafka key chứa `ticket_id` nhưng không được dùng. |
-| **Slide concept**   | "CDC log-based", "Xoá phải lan" — delete record phải tạo tombstone `is_deleted=true` tại Silver, sau đó lan xuống Gold (training snapshot filter `l._op <> 'd'`, RAG join `WHERE NOT t.is_deleted`).                                                                                  |
-| **Hướng sửa**       | Trong `ticket_changes_sql()`: extract `ticket_id` từ `j->'key'->>'ticket_id'` (luôn có) thay vì `j->'value'->'after'->>'ticket_id'`. Với `op='d'`, các cột khác để NULL, set `is_deleted = true`. Tombstone (`value=null`, `_op IS NULL`) đã bị filter ở dòng 56 — đúng.              |
+- mỗi ticket có đúng một current state;
+- late event đã được tính vào đúng ngày;
+- ticket bị xoá đã biến mất khỏi output cần thiết.
 
----
+Hai lớp kiểm tra này cho mình bằng chứng cụ thể sau mỗi lần sửa.
 
-## 4. Lateness đo được từ Bronze
+### Checksum — kiểm tra khả năng chạy lại
 
-```bash
-$ python main.py --lateness
-event lateness over 43 Bronze records (calendar days):
-  p50=0.00 p95=2.90 p99=3.00 max=3
--> lookback must be >= ceil(p99) = 3 day(s); config.LOOKBACK_DAYS = 0
-```
+Lab còn tính checksum của các bảng Gold.
 
-| Metric  | Giá trị   | Ý nghĩa                                   |
-| ------- | --------- | ----------------------------------------- |
-| **P50** | 0.00 ngày | Hầu hết events đến trong cùng ngày        |
-| **P95** | 2.90 ngày | 5% events trễ ≥ ~3 ngày                   |
-| **P99** | 3.00 ngày | 1% events trễ 3 ngày (u05 offline 3 ngày) |
-| **Max** | 3 ngày    | Cực đại trong seed                        |
+Checksum có thể hiểu như một dấu vân tay của dữ liệu. Nếu dữ liệu thay đổi thì checksum thay đổi theo.
 
-→ `LOOKBACK_DAYS = 3` là tối thiểu. Thực tế nên thêm buffer (vd 4-5 ngày) cho an toàn.
+Bài rerun tạo một fresh build trước, sau đó chạy lại cùng một ngày ba lần:
 
----
-
-## 5. Checksum — công cụ chấm điểm
-
-```python
-# pipeline/checksum.py:20-26
-def query_checksum(con, sql):
-    return con.execute(f"""
-        SELECT md5(coalesce(string_agg(CAST(t AS VARCHAR), chr(10)
-                                       ORDER BY CAST(t AS VARCHAR)), ''))
-        FROM ({sql}) AS t
-    """).fetchone()[0]
-```
-
-- **Order-independent**: sort toàn bộ row thành string → md5.
-- **Thay đổi 1 cell / 1 row / duplicate** → checksum đổi.
-- Chạy được ngay trong DuckDB CLI: `SELECT md5(...) FROM gold_feature_daily;`
-- **Rerun check** (`scripts/rerun_check.py`): fresh build (C0) → re-run ngày 08-12 3 lần (C1,C2,C3). PASS ⇔ **C0 = C1 = C2 = C3**.  
-  _Tại sao cần C0?_ Pipeline có thể "ổn định sai": lần chạy lại đầu tiên làm hỏng, các lần sau hỏng y như nhau → C1=C2=C3 nhưng ≠ C0 vẫn FAIL.
-
----
-
-## 6. Dùng DuckDB (lite) / dbt (track) — không phải Spark
-
-| Tiêu chí           | DuckDB (lite path)                       | dbt-duckdb (track)                                                  | Spark                   |
-| ------------------ | ---------------------------------------- | ------------------------------------------------------------------- | ----------------------- |
-| **Cỡ dữ liệu lab** | 7 ngày × ~few KB                         | giống nhau                                                          | Overkill                |
-| **Zero-setup**     | ✅ pip install                           | ✅ pip install                                                      | ❌ cluster              |
-| **SQL dialect**    | DuckDB (rich: QUALIFY, MERGE, window)    | dbt macros + DuckDB                                                 | Spark SQL               |
-| **Incremental**    | Hand-written MERGE / overwrite-partition | `incremental_strategy='merge'` + `merge_update_condition`           | Structured Streaming    |
-| **Microbatch**     | `DELETE + INSERT` window                 | `incremental_strategy='microbatch'` `batch_size='day'` `lookback=3` | Native                  |
-| **Testing**        | pytest + verify.py                       | `dbt test` + unit test + contract                                   | Great Expectations etc. |
-| **Dễ debug**       | In-process, print SQL                    | `dbt compile` → SQL thuần                                           | Phân tán                |
-
-**Khi nào lên Spark?** Data > memory đơn máy, multi-tenant, streaming latency < giây, team lớn cần governance. Lab 17: DuckDB đủ, tập trung vào **logic pipeline** chứ không phải engine.
-
----
-
-## 7. dbt track — parity với lite path
-
-```
-make dbt      # land Bronze → dbt build (PASS=19: 3 models + 13 tests + 1 unit test)
-make parity   # silver_tickets + gold_feature_daily: checksum lite vs dbt khớp nhau
+```text
+fresh build -> C0
+rerun #1    -> C1
+rerun #2    -> C2
+rerun #3    -> C3
 ```
 
-| Model dbt            | Chiến lược                          | Key config                                                                   |
-| -------------------- | ----------------------------------- | ---------------------------------------------------------------------------- |
-| `silver_tickets`     | `incremental_strategy='merge'`      | `unique_key=['ticket_id']`, `merge_update_condition='src._lsn > tgt._lsn'`   |
-| `gold_feature_daily` | `incremental_strategy='microbatch'` | `batch_size='day'`, `lookback=3`, contract `not_null` + `unique_combination` |
-| Unit test            | test logic dedup + delete           | `given`/`expect` fixture trong `dbt_project/models/`                         |
+Kết quả đạt yêu cầu khi:
 
-Parity đảm bảo **hai cách cài đặt cho cùng một kết quả** — tránh logic lệch giữa Python và SQL.
-
----
-
-## 8. Bonus (tối đa +10)
-
-| Bonus                | Yêu cầu                                                                                                                                                          | Trạng thái zero-key                  |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| **B1 — LLM cache**   | `pipeline/llm_label.py`: cache theo `hash(input) + model + prompt_version`. Re-run 0 LLM call. Đổi prompt → relabel có chủ đích. Output sai schema → quarantine. | `FakeLLM` sẵn, chạy `make bonus-llm` |
-| **B2a — Airflow 3**  | `docker compose -f docker/docker-compose.yml up` → 7 daily run thành công, chụp ảnh + log checksum                                                               | Cần Docker                           |
-| **B2b — Brainstorm** | Viết `bonus/DESIGN.md` theo `docs/bonus/BONUS-CHALLENGE.md`                                                                                                      | Không cần infra                      |
-
----
-
-## 9. Các khái niệm cốt lõi để nhớ lâu (self-quiz)
-
-### 9.1 Idempotency patterns
-
-| Pattern                  | Khi nào dùng                            | Lab 17 ở đâu                                            |
-| ------------------------ | --------------------------------------- | ------------------------------------------------------- |
-| Overwrite-partition      | Partition time-series, recompute window | `gold_feature_daily` (DELETE partition + INSERT)        |
-| MERGE upsert             | Key-based entity, update in-place       | `silver_tickets`, `silver_events`, `silver_transcripts` |
-| Rebuild full (CTAS)      | SCD2 history, cheap full scan           | `silver_ticket_history`                                 |
-| Insert-only + dedup view | Immutable facts, dedup at read          | `silver_events` (QUALIFY + MERGE)                       |
-
-### 9.2 Late-arriving events handling
-
-1. **Measure lateness từ Bronze** (event_time vs \_ingested_at) → P99.
-2. **Set lookback ≥ ceil(P99)**.
-3. **Daily run recompute [day - lookback, day]** → overwrite-partition Gold.
-4. **Backfill = same code path** (chạy tuần tự từng ngày).
-
-### 9.3 Snapshot training — point-in-time correctness
-
-- `v<day>` = trạng thái ticket **tính đến cuối ngày đó** (Bronze `upto=day`).
-- `priority_at_creation` = priority khi ticket tạo (`_op IN ('c','r')` first LSN).
-- Late feedback (arrive sau) → tạo **snapshot version mới** (`v<later_day>`), version cũ **bất biến**.
-- Deleted ticket (`op='d'`) → filter out ở latest snapshot (`l._op <> 'd'`).
-
-### 9.4 Embedding cache key
-
-`cache_key = (text_hash, model_version, prompt_version)`
-
-- `text_hash = sha256(chunk_text)` → deterministic.
-- Đổi model/prompt → bump version → cache miss → recompute có chủ đích.
-- Re-run same day → 0 embedding call mới.
-
----
-
-## 10. Câu hỏi suy ngẫm (chuẩn bị REPORT)
-
-### Q1: Snapshot bất biến vs quyền được xoá dữ liệu (GDPR/Right to be Forgotten)
-
-- Snapshot `v2026-08-12`..`v2026-08-14` chứa text T-97 (đã xoá 08-15). Snapshot immutable → không sửa được.
-- **Giải pháp thực tế**:
-  1. **Kho snapshot riêng** (cold storage) với retention policy, không serving.
-  2. **Serving layer** (Gold serving) chỉ đọc `latest snapshot` đã filter deleted.
-  3. **Legal hold**: nếu law yêu cầu xoá hoàn toàn → rebuild warehouse từ Bronze đã scrub PII (cần Bronze có thể xoá được — nhưng Bronze cam kết immutable → trade-off).
-  4. **Pseudo-anonymization tại Bronze**: hash `ticket_id` + salt per-day, giữ mapping riêng có TTL.
-
-### Q2: PII beyond regex (tên, địa chỉ, CCCD, BHYT...)
-
-- Regex chỉ che email/phone. Tên "Nguyễn Văn An" vẫn lọt.
-- **Chốt PII ở tầng nào?**
-  - **Bronze**: giữ nguyên (raw truth, audit).
-  - **Silver**: **PII detection & masking** (NER model / Presidio / cloud DLP) trước khi ghi Silver. Quarantine nếu detect high-risk.
-  - **Gold**: training set / doc chunks đã masked.
-- **Đo coverage**: `pii_coverage = (entities_detected_and_masked) / (entities_in_gold_standard_sample)`. Target ≥ 99.9% cho production.
-
----
-
-## 13. Nhật ký từng checkpoint (giọng intern)
-
-> Dưới đây là nhật ký thực hành — đâu là cái mình nghĩ, đâu là cái mình hỏi AI, đâu là cái mình review diff, đâu là cái mình run verify. Workflow theo VIBE-CODING: *Spec → Prompt → Review diff → Run test → Commit/Rollback*.
-
-### CP1 — Đọc đề và dựng baseline (20 phút)
-
-**Trước khi chạm code, mình nghĩ:**
-
-> *"Đọc README xong thấy 'repo này cố tình có 3 lỗi'. Đây không phải bug do mình tạo ra — seed đã thiết kế để fail từ đầu. Task rõ ràng: tìm 3 lỗi trong pipeline/, sửa, chứng minh rerun3 PASS. Nên chạy trước để thấy fail gì, mới biết sửa lỗi nào."*
-
-**Setup env (Windows — tốn hơn dự kiến):**
-1. `python -m venv .venv` sinh `bin/` không phải `Scripts/` — Python MSYS default.
-2. Dùng `uv` có sẵn: `uv venv --python 3.11.15 .venv` → `Scripts/` đúng. Cài 66 packages trong 15s.
-3. `python -m scripts.verify` → crash `UnicodeEncodeError` vì console cp1252 + output tiếng Việt.
-4. **Fix**: `$env:PYTHONIOENCODING = "utf-8"`. *Lesson: trên Windows luôn bật PYTHONIOENCODING=utf-8 trước verify.*
-
-**Baseline (trước fix):** VERIFY 8/18 FAIL, PYTEST 9 failed, LATENESS P99=3.00.
-
-### CP2 — Sửa khoá Silver (25 phút)
-
-**Đọc code trước khi prompt AI (VIBE pattern #2: validate trước generate):**
-
-> *"Mở `pipeline/silver.py:64-88`. `upsert_silver_tickets()`: tạo `_latest_changes` bằng
-> `QUALIFY row_number() OVER (PARTITION BY ticket_id ORDER BY _lsn DESC) = 1` —
-> đây là **dedup trong batch** đúng (LSN cao nhất trong cùng batch). Nhưng dòng 81-86:
-> `INSERT INTO silver_tickets SELECT ... FROM _latest_changes` — **append, không phải upsert!**
-> 3 ngày → 24 rows cho 12 ticket. Re-run batch cũ → LSN cũ append tiếp → state cũ thắng mới."*
-
-**Prompt AI (narrow, SDD pattern #1):**
-> *"Write DuckDB MERGE: target silver_tickets, source _latest_changes. ON t.ticket_id=s.ticket_id.
-> WHEN NOT MATCHED THEN INSERT. WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE.
-> Tie-break by LSN. If equal, skip."*
-
-**Review diff (VIBE pattern — không skip):**
-- Guard `s._lsn > t._lsn` đúng — LSN tăng đơn điệu WAL → mới thắng.
-- Redelivery cùng LSN (impossible trên WAL) → không update → safe.
-- `is_deleted`, `_batch_id` đều update để đồng bộ tombstone.
-
-**Result:** Silver 5/5 PASS. T-97 vẫn FAIL vì chưa CP4 — đúng thứ tự: fix Silver trước mới thấy được delete.
-
-### CP3 — Sửa dữ liệu đến muộn (25 phút)
-
-> *"Comment code: 'each run only needs to recompute its own day' — nghe hợp lý. Nhưng
-> P99=3 ngày! u05 offline 3 tối → event_time 08-12, ingested 08-15. LB=0 → daily run 08-15
-> chỉ recompute partition 08-15, quên 08-12. Full recompute có event 08-12 → checksum khác."*
-
-**Fix:** `config.LOOKBACK_DAYS = 3` (ceil(P99)). Apply cho **mọi daily run**, không chỉ backfill.
-**Verify:** `lateness` → p99=3.00, LOOKBACK_DAYS=3 ✅.
-
-### CP4 — Sửa CDC delete (25 phút)
-
-> *"Đọc `data/cdc/tickets/2026-08-15.jsonl`: delete record có `key: {"ticket_id": "T-97"}`,
-> `after: null`, `op: "d"`. Code staging.py:40 extract từ `value.after` → NULL → filter.
-> Key phải lấy từ **Kafka `key`**, không phải `value.after`."*
-
-**Fix staging.py:**
-- `coalesce(j->'key'->>'ticket_id', j->'value'->'after'->>'ticket_id')` — key luôn có.
-- `CASE WHEN _op = 'd' THEN NULL ELSE ... END` cho các field — không rò rỉ PII.
-- Tombstone (`value=null`) đã filter ở `WHERE _op IS NOT NULL` — đúng.
-
-**Verify ALL:**
-- `python -m scripts.verify` → **18/18 ALL PASS** ✅
-- `python -m pytest` → **34 passed** ✅
-- `python -m scripts.rerun_check` → **PASS** (C0=C1=C2=C3) ✅
-
-> *Challenge test evidence (commands from the 4 challenges):*
-> - **Challenge 1**: `pytest tests/test_contracts.py -k "one_row_per_ticket or latest_state_wins"` → **2 passed**
-> - **Challenge 2**: `python main.py --lateness` (P99=3.00) + `pytest -k "feature_daily or late_events or lookback"` → **3 passed**
-> - **Challenge 3**: `python -m scripts.verify` (18/18) + `python -m pytest` (34 passed) + `python -m scripts.rerun_check` (PASS)
-> - **Challenge 4**: `dbt build --event-time-start 2026-08-10 --event-time-end 2026-08-17` → **PASS=19**; `python -m scripts.parity` → **PARITY**
-
-> *Lesson: "CDC delete ≠ Kafka tombstone" — delete record có key + after=null + op='d'.
-> Tombstone Kafka (value=null) thì thực sự rỗng, chỉ để log compaction.*
-
-### CP5 — dbt và parity (25 phút)
-
-```
-make dbt → PASS=19 (3 models + 13 tests + 1 unit test + 2 views)
-make parity → PARITY — silver_tickets 3c15dfd43701, gold_feature_daily 8630e04a61d1
+```text
+C0 = C1 = C2 = C3
 ```
 
-> *"dbt silver_tickets dùng merge_update_condition='src._lsn > tgt._lsn' — đúng logic CP2.
-> gold_feature_daily microbatch + lookback=3 — đúng CP3. Unit test cho dedup+delete.
-> Parity = confidence: 2 implementation cho cùng 1 checksum."*
+Từ đây mình có khái niệm **idempotency**: chạy lại cùng một thao tác trên cùng dữ liệu không làm trạng thái cuối thay đổi thêm.
 
-### CP6 — Hoàn thiện bài nộp (30 phút)
+### Airflow — phần điều phối workflow trong bonus
 
-**Checklist:**
-- [x] checksums.txt PASS (C0=C1=C2=C3)
-- [x] REPORT.md: 3 lỗi + công thức + lựa chọn tool + 2 câu hỏi + output thực tế
-- [x] Verify 18/18, pytest 34/34, rerun3 PASS, lateness P99=3.00, dbt PASS=19, parity PARITY
-- [x] Tên repo đúng, không chứa secret
+Airflow xuất hiện trong một lựa chọn bonus của lab.
 
-> *Lesson: REPORT không phải decoration — coach đọc Report rồi hỏi follow-up.
-> Mỗi dòng fix phải giải thích được: tại sao, concept nào, trade-off ra sao.*
+Nó dùng **DAG** để mô tả các task và thứ tự chạy. Với backfill, Airflow có thể tạo run cho nhiều ngày lịch sử rồi thực thi theo lịch đã định.
 
-### CP7 — Bonus B1 + B2b (+10)
+Trong bài nộp này mình chọn B2b brainstorm, nên Airflow chỉ nằm trong phần kiến thức tổng quan. Tài liệu bonus mô tả việc backfill bảy ngày và yêu cầu các run thực tế thành công.
 
-- **B1 LLM step**: `pipeline/llm_label.py` rewrite — cache `hash(input)+model+prompt_version` trong `llm_label_cache`, quarantine off-schema (kể cả invalid để re-run vẫn 0 calls), ước tính cost trước, version `model`+`prompt_version` trên từng hàng Gold. `make bonus-llm` → **BONUS PASS** (6/6 OK). Provider thật `OpenAILLM(o4-mini)` gate bằng `OPENAI_API_KEY`, interface `complete()`+counter giống `FakeLLM`.
-- **B2b DESIGN.md**: brainstorm flywheel chat VN → eval+SFT dataset, leakage-safe. 6 quyết định (schema drift, batch vs streaming, point-in-time session split, decontamination SHA-256+LSH, quarantine SLO, cost swap `text-embedding-3-small`) + 1 rejected alternative (toàn bộ LSH) + architecture sketch. ≥600 từ → **BONUS PASS**.
-- *Lesson: user đã chỉnh chỉnh model là openai/o4-mini (không phải Gemini như agent tự bịa) — sửa `GeminiLLM→OpenAILLM`, `EMBEDDING_MODEL_VERSION="text-embedding-3-small"`. Bonus không trừ core.
+### LLM step — một transform có cache và version
+
+Bonus B1 thêm một bước gán nhãn bằng LLM.
+
+Phần này giúp mình thấy một model call cũng cần được quản lý giống các transform khác:
+
+- input giống nhau có thể cache;
+- đổi model hoặc prompt version thì output được xem là một version mới;
+- output sai schema đi quarantine;
+- cost được ước tính trước khi chạy.
+
+### Bản đồ stack sau khi ghép lại
+
+```text
+Nguồn dữ liệu
+    │
+    ├─ Debezium CDC: thay đổi của ticket
+    ├─ Kafka-style events: click / feedback
+    └─ S3-style files: transcript
+    │
+    ▼
+Bronze
+    └─ Parquet
+    │
+    ▼
+Staging + Quality
+    ├─ DuckDB SQL
+    └─ Pydantic validation
+    │
+    ▼
+Silver
+    ├─ key
+    ├─ dedup / upsert
+    ├─ SCD2 history
+    └─ PII masking
+    │
+    ▼
+Gold
+    ├─ feature + lookback
+    ├─ training snapshot
+    └─ chunk/cache
+    │
+    ├─ dbt: cách triển khai SQL thứ hai
+    ├─ Airflow: orchestration ở bonus
+    └─ pytest / verify / checksum: kiểm chứng kết quả
+```
+
+Đến đây các thuật ngữ chính của bài đã có vị trí cụ thể trong pipeline. Phần sau đi sâu vào từng lỗi và cách mình lần từ kết quả kiểm tra về đúng bước đang xử lý sai.
+
+---
+
+## 3. Bronze: vì sao phải giữ cả dữ liệu xấu
+
+Lúc đầu mình thấy hơi ngược: đã biết record bị trùng hoặc hỏng thì sao không bỏ luôn ở Bronze?
+
+Sau khi làm bài mình mới thấy lý do. Ở Bronze mình chưa có đủ ngữ cảnh để quyết định record nào nên bỏ. Một Kafka tombstone, một CDC delete hay một record bị gửi lại có thể trông “xấu”, nhưng chúng lại là bằng chứng cần thiết để dựng đúng state ở phía sau.
+
+Vì vậy Bronze giữ nguyên:
+
+- payload gốc;
+- duplicate;
+- tombstone;
+- bad record;
+- metadata ingest và batch.
+
+`land_batch()` cũng phải idempotent. Nếu file của source/day đó đã tồn tại thì lần chạy lại không được tạo thêm một bản khác.
+
+---
+
+## 4. Staging và điểm dễ sai của CDC
+
+Đây là chỗ mình vấp rõ nhất với T-97.
+
+Một record Debezium delete có dạng gần như sau:
+
+```text
+key   = {"ticket_id": "T-97"}
+value = {
+  "before": {...},
+  "after": null,
+  "source": {"lsn": ...},
+  "op": "d"
+}
+```
+
+Ban đầu code lấy `ticket_id` từ `value.after`. Với create/update thì cách đó chạy được, nên nhìn qua rất khó phát hiện. Nhưng delete có `after=null`, vì vậy `ticket_id` thành NULL. Sau đó câu `WHERE ticket_id IS NOT NULL` loại luôn record delete.
+
+Mình lần ngược từ lỗi verify: T-97 chưa bị xoá ở Silver. Từ đó kiểm tra staging, rồi mở record CDC thật của ngày 08-15. Khi nhìn thấy key vẫn còn `ticket_id` còn `after` đã null thì nguyên nhân gần như rõ ngay.
+
+Cách sửa là ưu tiên Kafka key:
+
+```sql
+coalesce(
+  j->'key'->>'ticket_id',
+  j->'value'->'after'->>'ticket_id'
+)
+```
+
+Đến đây mình phân biệt được hai thứ trước đó hay lẫn:
+
+- CDC delete: còn `key`, có `op='d'`, `after=null`;
+- Kafka tombstone: `value=null`, dùng cho log compaction.
+
+Hai record này không có cùng vai trò.
+
+LSN cũng quan trọng. `source.lsn` cho biết thứ tự thay đổi trong WAL. Khi chọn state mới nhất, mình ưu tiên LSN vì nó phản ánh thứ tự thay đổi của CDC.
+
+---
+
+## 5. Silver: dedup trong batch chưa phải là upsert
+
+Bug Silver làm mình mất thời gian vì `_latest_changes` nhìn khá đúng.
+
+Code đã có:
+
+```sql
+row_number() over (
+  partition by ticket_id
+  order by _lsn desc
+)
+```
+
+Nhìn vào đây mình tưởng state đã được dedup. Nhưng đoạn này chỉ chọn bản mới nhất **trong batch đang xử lý**.
+
+Ngay sau đó code lại:
+
+```sql
+INSERT INTO silver_tickets ...
+```
+
+Thế là batch nào chạy cũng append thêm một hàng. Khi chạy nhiều ngày, cùng một `ticket_id` có nhiều state. Nếu re-run batch cũ thì state cũ còn được thêm trở lại.
+
+Mình tách bài toán thành hai lớp:
+
+1. Trong source batch: chọn thay đổi mới nhất của mỗi ticket.
+2. Giữa source batch và bảng Silver hiện có: chỉ cho phép state có LSN mới hơn ghi đè state cũ.
+
+Vì vậy `MERGE` hợp lý hơn:
+
+```text
+ON t.ticket_id = s.ticket_id
+WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE
+WHEN NOT MATCHED THEN INSERT
+```
+
+Guard `_lsn > t._lsn` là phần quan trọng. Nếu chạy lại batch cũ, source có LSN thấp hơn nên bảng không đổi. Nhờ vậy rerun mới thật sự idempotent.
+
+Sau sửa này, T-91 chỉ còn state cuối là `high / closed / bug`.
+
+---
+
+## 6. Late-arriving data: vì sao partition cũ cần được tính lại
+
+Bug thứ hai ban đầu nhìn giống lỗi aggregate.
+
+`gold_feature_daily` của u05 ngày 08-12 chỉ có `(2,0)` trong khi full recompute cho `(5,1)`. Mình kiểm tra event thì thấy ba event còn lại có `event_time=08-12` nhưng đến hệ thống vào 08-15.
+
+Pipeline chạy ngày 08-15 đã ingest được các event đó vào Silver. Vấn đề là Gold chỉ tính lại ngày 08-15 vì:
+
+```text
+LOOKBACK_DAYS = 0
+```
+
+Như vậy dữ liệu đã có trong Silver nhưng partition 08-12 không bao giờ được mở lại để tính.
+
+Lúc này P99 lateness mới có ý nghĩa thực tế:
+
+```text
+p50 = 0.00 ngày
+p95 = 2.90 ngày
+p99 = 3.00 ngày
+max = 3 ngày
+```
+
+Mình đặt `LOOKBACK_DAYS = 3`. Mỗi daily run sẽ tính lại từ `day-3` đến `day`. Khi event ngày 08-12 đến vào 08-15, partition 08-12 được recompute và kết quả khớp full build.
+
+Điểm mình rút ra ở đây là lookback nên dựa trên lateness đo từ Bronze. Nếu tự chọn một con số “có vẻ đủ” thì pipeline có thể vẫn sai mà rất khó nhìn thấy.
+
+---
+
+## 7. Gold: cùng là dữ liệu sạch nhưng mỗi bảng cần một kiểu đúng khác nhau
+
+Sau khi sửa ba bug, mình thấy Gold không thể dùng một chiến lược ghi chung cho mọi bảng.
+
+### `gold_feature_daily`
+
+Đây là dữ liệu theo ngày. Late event có thể làm thay đổi partition cũ, nên cách hợp lý là recompute một cửa sổ thời gian rồi overwrite các partition đó.
+
+### `gold_training_set`
+
+Training data cần point-in-time correctness. Snapshot `v2026-08-12` phải phản ánh những gì hệ thống biết đến ngày 08-12, không được âm thầm nhận feedback của ngày 08-15.
+
+Vì vậy khi có dữ liệu mới, mình tạo snapshot version mới. Snapshot cũ giữ nguyên.
+
+### `gold_doc_chunks`
+
+RAG chunks cần tính ổn định. Text giống nhau với cùng model version thì embedding không nên chạy lại. Cache key dùng hash của text và version của model.
+
+Ba bảng đều ở Gold nhưng bài toán hoàn toàn khác nhau. Cách ghi phải theo cách dữ liệu thay đổi, không theo tên tầng.
+
+---
+
+## 8. Vì sao checksum cần fresh build làm mốc
+
+Rerun test có dạng:
+
+```text
+fresh build -> C0
+rerun #1    -> C1
+rerun #2    -> C2
+rerun #3    -> C3
+```
+
+Điều kiện là:
+
+```text
+C0 = C1 = C2 = C3
+```
+
+Trước đây mình nghĩ chỉ cần `C1=C2=C3` là đủ. Nhưng pipeline có thể hỏng ở lần rerun đầu tiên rồi giữ nguyên trạng thái hỏng ở hai lần sau. Khi đó ba checksum sau vẫn bằng nhau.
+
+`C0` là mốc để biết rerun không chỉ “ổn định”, mà còn ổn định so với trạng thái đúng ban đầu.
+
+Kết quả cuối:
+
+```text
+gold (combined)
+C0 = C1 = C2 = C3
+39e115c510ecdf526800eac227158a4f
+```
+
+---
+
+## 9. Lựa chọn DuckDB và dbt cho lab
+
+Data của lab rất nhỏ, dưới 1 MB. Nếu dùng Spark thì phần lớn công sức sẽ chuyển sang setup và runtime, trong khi lỗi thật của bài nằm ở CDC, idempotency, late data và snapshot.
+
+DuckDB cho mình:
+
+- chạy local nhanh;
+- có `MERGE`, window function và `QUALIFY`;
+- dễ inspect SQL;
+- dễ chạy lại test.
+
+dbt được dùng như một implementation thứ hai cho cùng logic. Sau khi lite pipeline và dbt cho cùng checksum ở `silver_tickets` và `gold_feature_daily`, mình có thêm một lớp kiểm tra rằng hai cách viết không bị lệch nhau.
+
+```text
+silver_tickets       lite 3c15dfd43701  dbt 3c15dfd43701
+gold_feature_daily   lite 8630e04a61d1  dbt 8630e04a61d1
+```
+
+---
+
+## 10. PII: regex chỉ giải quyết phần dễ
+
+Regex hiện tại che được email và số điện thoại. Tên người như “Nguyễn Văn An” vẫn đi qua.
+
+Nếu làm thật, mình sẽ xử lý PII ở Silver. Bronze vẫn giữ raw để replay/audit; Silver là ranh giới trước khi dữ liệu đi vào training set hoặc RAG.
+
+Một hướng hợp lý là:
+
+1. regex cho pattern rõ như email, phone;
+2. NER/DLP cho person name, địa chỉ, mã định danh;
+3. quarantine record có rủi ro cao;
+4. đo coverage trên sample đã gán nhãn thủ công.
+
+Gold chỉ nên nhận dữ liệu đã qua bước này.
+
+---
+
+## 11. Snapshot bất biến và quyền được xoá
+
+T-97 bị xoá ngày 08-15. Vì vậy snapshot 08-12 đến 08-14 vẫn có T-97 nếu mình dựng đúng theo trạng thái lịch sử.
+
+Trong lab, điều này không mâu thuẫn: snapshot cũ đại diện cho quá khứ, còn serving layer dùng snapshot mới đã loại T-97.
+
+Nhưng nếu có yêu cầu pháp lý phải xoá dữ liệu khỏi toàn bộ lịch sử thì “snapshot bất biến” không còn là luật tuyệt đối. Khi đó cần cơ chế scrub nguồn và rebuild dữ liệu liên quan. Đây là trade-off giữa khả năng tái lập lịch sử và yêu cầu xoá dữ liệu.
+
+---
+
+## 12. Bonus LLM: quản lý một bước transform có model
+
+Phần bonus làm mình thấy LLM trong data pipeline nên được đối xử như một transform có version.
+
+Cache key:
+
+```text
+hash(input) + model + prompt_version
+```
+
+Nếu ba thứ này không đổi thì rerun phải dùng cache và tạo 0 LLM call. Nếu prompt đổi, cache miss là có chủ đích vì output cũ không còn cùng version.
+
+Output của model cũng không được đẩy thẳng vào Gold. `parse_label()` chỉ nhận:
+
+```json
+{ "label": "bug" }
+```
+
+với label thuộc `bug | billing | other`.
+
+Nếu model trả sai schema thì record vào quarantine. Raw response đó vẫn được cache; lần rerun sau có thể nhận lại kết quả đã biết mà không phát sinh thêm một lần gọi model.
+
+Kết quả:
+
+```text
+BONUS PASS
+```
 
 ---
