@@ -22,3 +22,6 @@ docker/dags/lake/
 logs/
 
 .env
+
+# internal scratchpad / working notes (not a graded artifact)
+reflection.md
