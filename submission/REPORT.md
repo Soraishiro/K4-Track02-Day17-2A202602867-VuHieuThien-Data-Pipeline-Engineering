@@ -2,7 +2,7 @@
 
 **Họ tên / MSSV:** Vũ Hiếu Thiên / 2A202602867
 **Repo:** https://github.com/Soraishiro/K4-Track02-Day17-2A202602867-VuHieuThien-Data-Pipeline-Engineering
-**Commit bài nộp:** (commit kèm fix + checksums.txt + REPORT.md khi nộp)
+**Commit bài nộp:** `a0ac75929f5e9ee2a1a6c3204091e3bd91217aa5` (hoàn chỉnh code + bonus + checksums.txt + REPORT; các check verify/pytest/rerun/dbt/parity/B1 đều chạy trên commit này)
 **AI đã dùng và phạm vi hỗ trợ:** Dùng Kilo CLI agent để read code, đưa ra spec, review diff dòng-lẻ, chạy verify/pytest/rerun/dbt/parity. AI không tự implement — mỗi thay đổi review logic trước khi áp dụng.
 **Nguồn tham khảo:** README.md, docs/CHECKPOINTS.md, docs/VIBE-CODING.md, docs/RUBRIC.md của repo đề bài.
 
