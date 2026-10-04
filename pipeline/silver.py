@@ -76,13 +76,25 @@ def upsert_silver_tickets(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     """)
     (n_changes,) = con.execute("SELECT count(*) FROM _latest_changes").fetchone()
 
-    # Write this batch's changes to Silver.
+    # Write this batch's changes to Silver using a key-based upsert.
     # A delete arrives as a change with is_deleted = true and every PII column null.
+    # _latest_changes already keeps only the newest change per ticket in THIS batch
+    # (QUALIFY ... ORDER BY _lsn DESC). We then upsert by key, letting the row with
+    # the higher LSN win so a re-run of an OLD batch never overwrites a newer state —
+    # this is exactly the dedup/upsert distinction the slide calls out: dedup within
+    # a batch, upsert across batches, both tie-broken by the CDC LSN.
     con.execute("""
-        INSERT INTO silver_tickets
-        SELECT ticket_id, user_id, subject, body, priority, status, category,
-               created_at, updated_at, is_deleted, _lsn, _batch_id
-        FROM _latest_changes
+        MERGE INTO silver_tickets AS t
+        USING _latest_changes AS s
+        ON t.ticket_id = s.ticket_id
+        WHEN NOT MATCHED THEN INSERT VALUES (
+            s.ticket_id, s.user_id, s.subject, s.body, s.priority, s.status, s.category,
+            s.created_at, s.updated_at, s.is_deleted, s._lsn, s._batch_id)
+        WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE SET
+            user_id = s.user_id, subject = s.subject, body = s.body,
+            priority = s.priority, status = s.status, category = s.category,
+            created_at = s.created_at, updated_at = s.updated_at,
+            is_deleted = s.is_deleted, _lsn = s._lsn, _batch_id = s._batch_id
     """)
     (n_rows,) = con.execute("SELECT count(*) FROM silver_tickets").fetchone()
     return {"changes_in_batch": n_changes, "silver_rows": n_rows}

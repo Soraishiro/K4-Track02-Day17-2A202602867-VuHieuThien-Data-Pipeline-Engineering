@@ -33,22 +33,36 @@ def ticket_changes_sql(upto: str | None = None, batch: str | None = None) -> str
 
     `upto`  -> only batches landed on or before that day (as-of / time travel)
     `batch` -> only that day's batch (what a daily incremental run sees)
+
+    Note on key sourcing: a Debezium delete carries `value.after = null` (only
+    `value.before`, `source.lsn`, `op = 'd'` survive), so the ticket_id MUST be
+    read from the Kafka record `key`, not from `after`. Tombstones (value = null)
+    are still filtered out explicitly.
     """
     return f"""
     SELECT * FROM (
         SELECT
-            j->'value'->'after'->>'ticket_id'                       AS ticket_id,
+            coalesce(j->'key'->>'ticket_id',
+                     j->'value'->'after'->>'ticket_id')            AS ticket_id,
             _op,
             (j->'value'->'source'->>'lsn')::BIGINT                  AS _lsn,
             make_timestamp((j->'value'->'source'->>'ts_ms')::BIGINT * 1000) AS _changed_at,
-            j->'value'->'after'->>'user_id'                         AS user_id,
-            j->'value'->'after'->>'subject'                         AS subject,
-            j->'value'->'after'->>'body'                            AS body,
-            j->'value'->'after'->>'priority'                        AS priority,
-            j->'value'->'after'->>'status'                          AS status,
-            j->'value'->'after'->>'category'                        AS category,
-            make_timestamp((j->'value'->'after'->>'created_at')::BIGINT) AS created_at,
-            make_timestamp((j->'value'->'after'->>'updated_at')::BIGINT) AS updated_at,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE j->'value'->'after'->>'user_id' END         AS user_id,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE j->'value'->'after'->>'subject' END         AS subject,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE j->'value'->'after'->>'body' END            AS body,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE j->'value'->'after'->>'priority' END        AS priority,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE j->'value'->'after'->>'status' END          AS status,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE j->'value'->'after'->>'category' END        AS category,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE make_timestamp((j->'value'->'after'->>'created_at')::BIGINT) END AS created_at,
+            CASE WHEN _op = 'd' THEN NULL
+                 ELSE make_timestamp((j->'value'->'after'->>'updated_at')::BIGINT) END AS updated_at,
             _batch_id,
             _ingested_at,
             _kafka_offset
